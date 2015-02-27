@@ -684,12 +684,15 @@ __EXPORT void board_crashdump(uint32_t currentsp, void *tcb, uint8_t *filename, 
 
   n = snprintf(line, sizeof(line), "\n Oh I see the Problem...");
   write(fd, line,n);
+  fflush(stdout);
   sleep(1);
   n = snprintf(line, sizeof(line), "it is on line 60.. of...");
   write(fd, line,n);
+  fflush(stdout);
   sleep(1);
   n = snprintf(line, sizeof(line), "nah just kidding\n\n");
   write(fd, line,n);
+  fflush(stdout);
 
 #if defined(CONFIG_BOARD_RESET_ON_CRASH)
   systemreset(false);
