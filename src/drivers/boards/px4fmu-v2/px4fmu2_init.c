@@ -49,6 +49,7 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 #include <debug.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -72,12 +73,17 @@
 #include <drivers/drv_hrt.h>
 #include <drivers/drv_led.h>
 
+#include <systemlib/px4_macros.h>
 #include <systemlib/cpuload.h>
 #include <systemlib/perf_counter.h>
+
+#include <systemlib/hardfault_log.h>
 
 #if defined(CONFIG_HAVE_CXX) && defined(CONFIG_HAVE_CXXINITIALIZE)
 #include <systemlib/systemlib.h>
 #endif
+
+#include "up_internal.h"
 
 /* todo: This is constant but not proper */
 __BEGIN_DECLS
@@ -87,6 +93,10 @@ __END_DECLS
 /****************************************************************************
  * Pre-Processor Definitions
  ****************************************************************************/
+#define xstr(s) str(s)
+#define str(s) #s
+#define HARDFAULT_FILENO 3
+#define HARDFAULT_PATH BBSRAM_PATH""xstr(HARDFAULT_FILENO)
 
 /* Configuration ************************************************************/
 
@@ -243,12 +253,12 @@ __EXPORT int nsh_archinitialize(void)
 #  error platform is dependent on c++ both CONFIG_HAVE_CXX and CONFIG_HAVE_CXXINITIALIZE must be defined.
 #endif
 #if defined(CONFIG_STM32_BBSRAM)
-	int filesizes[CONFIG_STM32_BBSRAM_FILES+1] = {1, 256, 256, -1, 0};
-	int nfc = stm32_bbsraminitialize("/fs/bbr", filesizes);
+	int filesizes[CONFIG_STM32_BBSRAM_FILES+1] = BSRAM_FILE_SIZES;
+	int nfc = stm32_bbsraminitialize(BBSRAM_PATH, filesizes);
 
         syslog(LOG_INFO, "[boot] %d Battery Back File(s) \n",nfc);
 #if defined(CONFIG_STM32_SAVE_CRASHDUMP)
-        int fd = open("/fs/bbr3",O_RDONLY);
+        int fd = open(HARDFAULT_PATH,O_RDONLY);
         if (fd < 0 ) {
             syslog(LOG_INFO, "[boot] Failed to open Crash Log file (%d)\n",fd);
         } else {
@@ -268,7 +278,7 @@ __EXPORT int nsh_archinitialize(void)
                 if (rv < 0) {
                     syslog(LOG_INFO, "[boot] Failed to Close Crash Log (%d)\n",rv);
                 } else {
-                    rv = unlink("/fs/bbr3");
+                    rv = unlink(HARDFAULT_PATH);
                     if (rv < 0) {
                         syslog(LOG_INFO, "[boot] Failed to Rearm Crash Log (%d)\n",rv);
                     }
@@ -390,4 +400,178 @@ __EXPORT int nsh_archinitialize(void)
 #endif
 
 	return OK;
+}
+
+static void print_stack(stack_word_t *swindow, int winsize, uint32_t wtopaddr,
+                        uint32_t topaddr, uint32_t spaddr, uint32_t botaddr,
+                        char *sp_name, char *buffer, int max, int fd)
+{
+   char marker[30];
+   for (int i = winsize; i >= 0; i--) {
+       if (wtopaddr == topaddr) {
+           strncpy(marker, "<-- ", sizeof(marker));
+           strncat(marker, sp_name, sizeof(marker));
+           strncat(marker, " top", sizeof(marker));
+       } else if (wtopaddr == spaddr) {
+           strncpy(marker, "<-- ", sizeof(marker));
+           strncat(marker, sp_name, sizeof(marker));
+       } else if (wtopaddr == botaddr) {
+           strncpy(marker, "<-- ", sizeof(marker));
+           strncat(marker, sp_name, sizeof(marker));
+           strncat(marker, " bottom", sizeof(marker));
+       } else {
+           marker[0] = '\0';
+       }
+       int n = snprintf(buffer, max,"0x%08x 0x%08x%s\n", wtopaddr, swindow[i], marker);
+       write(fd, buffer,n);
+       wtopaddr--;
+    }
+}
+
+fullcontext_s dump;
+
+__EXPORT void board_crashdump(uint32_t currentsp, void *tcb, uint8_t *filename, int lineno)
+{
+  (void)irqsave();
+
+  struct tcb_s *rtcb = (struct tcb_s *)tcb;
+
+  /* Zero out everything */
+
+  memset(&dump,0,sizeof(dump));
+
+  /* Save Info */
+
+  dump.info.lineno = lineno;
+
+  if (filename) {
+
+    int offset = 0;
+    unsigned int len = strlen((char*)filename) + 1;
+    if (len > sizeof(dump.info.filename)) {
+        offset = len - sizeof(dump.info.filename) ;
+    }
+    strncpy(dump.info.filename, (char*)&filename[offset], sizeof(dump.info.filename));
+  }
+
+  /* Save the value of the pointer for current_regs as debugging info.
+   * It should be NULL in case of an ASSERT and will aid in cross
+   * checking the validity of system memory at the time of the
+   * fault.
+   */
+
+  dump.info.current_regs = (uintptr_t) current_regs;
+
+  /* Save Context */
+
+  /* If not NULL then we are in an interrupt context and the user context
+   * is in current_regs else we are running in the users context
+   */
+
+#if CONFIG_TASK_NAME_SIZE > 0
+  strncpy(dump.context.proc.name, rtcb->name, CONFIG_TASK_NAME_SIZE);
+#endif
+
+  dump.context.proc.pid = rtcb->pid;
+
+  dump.context.stack.current_sp = currentsp;
+
+  if (current_regs)
+    {
+      dump.info.stuff |= eRegs;
+      memcpy(&dump.context.proc.xcp.regs, (void*)current_regs, sizeof(dump.context.proc.xcp));
+      currentsp = dump.context.proc.xcp.regs[REG_R13];
+    }
+
+
+  dump.context.stack.itopofstack = (uint32_t) &g_intstackbase;;
+  dump.context.stack.istacksize = (CONFIG_ARCH_INTERRUPTSTACK & ~3);
+
+  if (dump.context.proc.pid == 0) {
+
+      dump.context.stack.utopofstack = g_idle_topstack - 4;
+      dump.context.stack.ustacksize = CONFIG_IDLETHREAD_STACKSIZE;
+
+  } else {
+      dump.context.stack.utopofstack = (uint32_t) rtcb->adj_stack_ptr;
+      dump.context.stack.ustacksize = (uint32_t) rtcb->adj_stack_size;;
+  }
+
+#if CONFIG_ARCH_INTERRUPTSTACK > 3
+
+  /* Get the limits on the interrupt stack memory */
+
+  dump.context.stack.itopofstack = (uint32_t)&g_intstackbase;
+  dump.context.stack.istacksize  = (CONFIG_ARCH_INTERRUPTSTACK & ~3);
+
+  /* If the current stack pointer is within the interrupt stack then
+   * save the interrupt stack data centered about the interrupt stack pointer
+   */
+
+  if (dump.context.stack.current_sp <= dump.context.stack.itopofstack &&
+      dump.context.stack.current_sp > dump.context.stack.itopofstack - dump.context.stack.istacksize)
+    {
+      dump.info.stuff |= eIntStack;
+      memcpy(&dump.istack, (void *)(dump.context.stack.current_sp-sizeof(dump.istack)/2),
+             sizeof(dump.istack));
+   }
+
+#endif
+
+  /*  If the saved context of the interrupted process's stack pointer lies within the
+   * allocated user stack memory then save the user stack centered about the user sp
+   */
+  if (currentsp <= dump.context.stack.utopofstack &&
+      currentsp  > dump.context.stack.utopofstack - dump.context.stack.ustacksize)
+    {
+      dump.info.stuff |= eUserStack;
+      memcpy(&dump.ustack, (void *)(currentsp-sizeof(dump.ustack)/2), sizeof(dump.ustack));
+    }
+
+  /* Oh boy we have a real hot mess on our hands so save above and below the
+   * current sp
+   */
+
+  if ((dump.info.stuff & eStackValid) == 0)
+    {
+      dump.info.stuff |= eStackUnknown;
+#if CONFIG_ARCH_INTERRUPTSTACK > 3
+      /* sp and above in istack */
+      memcpy(&dump.istack, (void *)dump.context.stack.current_sp, sizeof(dump.istack));
+      /* below in ustack */
+      memcpy(&dump.ustack, (void *)(dump.context.stack.current_sp-sizeof(dump.ustack)),
+             sizeof(dump.ustack));
+#else
+      /* save above and below in ustack */
+      memcpy(&dump.ustack, (void *)(dump.context.stack.current_sp-sizeof(dump.ustack)/2),
+             sizeof(dump.ustack)/2);
+#endif
+    }
+
+  stm32_bbsram_savepanic(HARDFAULT_FILENO, (uint8_t*)&dump, sizeof(dump));
+
+  char line[80];
+
+  int spaddr = dump.context.stack.current_sp;
+  int topaddr = dump.context.stack.itopofstack;
+  int botaddr = dump.context.stack.itopofstack - dump.context.stack.istacksize;
+  int winsize = arraySize(dump.istack);
+  int wtopaddr = spaddr + winsize/2;
+  if ((dump.info.stuff & eIntStack) != 0) {
+      print_stack(dump.istack, winsize, wtopaddr, topaddr, spaddr, botaddr,
+                  "Interrupt sp", line, sizeof(line), fileno(stdout));
+  }
+  if ((dump.info.stuff & eUserStack) != 0) {
+      spaddr = dump.context.proc.xcp.regs[REG_R13];
+      topaddr = dump.context.stack.utopofstack;
+      botaddr = dump.context.stack.utopofstack - dump.context.stack.ustacksize;
+      winsize = arraySize(dump.ustack);
+      wtopaddr = spaddr + winsize/2;
+      print_stack(dump.istack, winsize, wtopaddr, topaddr, spaddr, botaddr,
+                  "User sp", line, sizeof(line), fileno(stdout));
+  }
+
+#if defined(CONFIG_BOARD_RESET_ON_CRASH)
+  systemreset(false);
+#endif
 }
