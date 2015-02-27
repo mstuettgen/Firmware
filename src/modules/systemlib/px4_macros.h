@@ -97,5 +97,10 @@
 #	endif
 #endif
 
+#if !defined(STRINGIFY)
+#define FREEZE_STR(s) #s
+#define STRINGIFY(s) FREEZE_STR(s)
+#endif
+
 
 #endif /* _PX4_MACROS_H */

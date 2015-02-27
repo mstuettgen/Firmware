@@ -31,9 +31,14 @@
  *
  ****************************************************************************/
 #pragma once
+/****************************************************************************
+ * Included Files
+ ****************************************************************************/
 #include <systemlib/px4_macros.h>
 
-
+/****************************************************************************
+ * Pre-processor Definitions
+ ****************************************************************************/
 #define BBSRAM_SIZE_FN0 1
 #define BBSRAM_SIZE_FN1 256
 #define BBSRAM_SIZE_FN2 256
@@ -70,6 +75,11 @@
 }
 
 #define MAX_FILE_PATH_LENGTH 40
+
+/****************************************************************************
+ * Public Types
+ ****************************************************************************/
+
 typedef uint32_t stack_word_t;
 
 typedef  struct {
@@ -91,6 +101,8 @@ typedef struct {
 #endif
 
 } stack_t;
+
+/* for reference only */
 
 typedef struct
 {
@@ -172,11 +184,7 @@ typedef struct
   uint32_t s31;
 } proc_regs_s;
 
-typedef enum {
-  ePanicHardFault,
-  ePanicAssert,
-} panictype_t;
-
+/* What is in the dump */
 typedef enum {
   eRegs         = 0x01,
   eUserStack    = 0x02,
@@ -186,8 +194,8 @@ typedef enum {
 } stuff_t;
 
 typedef struct {
-  stuff_t stuff;
-  uintptr_t current_regs;
+  stuff_t stuff;          /* What is in the dump */
+  uintptr_t current_regs; /* Used to validate the dump */
   int lineno;
   char filename[MAX_FILE_PATH_LENGTH];
 } info_s;

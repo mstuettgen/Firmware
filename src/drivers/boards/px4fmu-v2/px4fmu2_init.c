@@ -78,6 +78,7 @@
 #include <systemlib/perf_counter.h>
 
 #include <systemlib/hardfault_log.h>
+#include <lib/version/version.h>
 
 #if defined(CONFIG_HAVE_CXX) && defined(CONFIG_HAVE_CXXINITIALIZE)
 #include <systemlib/systemlib.h>
@@ -93,10 +94,10 @@ __END_DECLS
 /****************************************************************************
  * Pre-Processor Definitions
  ****************************************************************************/
-#define xstr(s) str(s)
-#define str(s) #s
+#define FREEZE_STR(s) #s
+#define STRINGIFY(s) FREEZE_STR(s)
 #define HARDFAULT_FILENO 3
-#define HARDFAULT_PATH BBSRAM_PATH""xstr(HARDFAULT_FILENO)
+#define HARDFAULT_PATH BBSRAM_PATH""STRINGIFY(HARDFAULT_FILENO)
 
 /* Configuration ************************************************************/
 
@@ -402,6 +403,28 @@ __EXPORT int nsh_archinitialize(void)
 	return OK;
 }
 
+static void print_stack_info(int size, uint32_t topaddr, uint32_t spaddr,
+                             uint32_t botaddr, char *sp_name, char *buffer, int max, int fd)
+{
+
+  int n = 0;
+  n =   snprintf(&buffer[n], max-n, "%s stack:\n",sp_name);
+  n +=  snprintf(&buffer[n], max-n, "  top:    0x%08x\n", topaddr);
+  n +=  snprintf(&buffer[n], max-n, "  sp:     0x%08x\n", spaddr);
+  write(fd, buffer,n);
+  n = 0;
+  n +=  snprintf(&buffer[n], max-n, "  bottom: 0x%08x\n", botaddr);
+  n +=  snprintf(&buffer[n], max-n, "  size:   0x%08x\n", size);
+  write(fd, buffer,n);
+#ifndef CONFIG_STACK_COLORATION
+  FAR struct tcb_s tcb;
+  tcb.stack_alloc_ptr = (void*) botaddr;
+  tcb.adj_stack_size = size;
+  n = snprintf(buffer, max,         "  used:   %08x\n", up_check_tcbstack(&tcb));
+  write(fd, buffer,n);
+#endif
+}
+
 static void print_stack(stack_word_t *swindow, int winsize, uint32_t wtopaddr,
                         uint32_t topaddr, uint32_t spaddr, uint32_t botaddr,
                         char *sp_name, char *buffer, int max, int fd)
@@ -427,6 +450,41 @@ static void print_stack(stack_word_t *swindow, int winsize, uint32_t wtopaddr,
        wtopaddr--;
     }
 }
+
+static void print_register(fullcontext_s* fc, char *buffer, int max, int fd)
+{
+    int n = snprintf(buffer, max, "r0:0x%08x r1:0x%08x  r2:0x%08x  r3:0x%08x  r4:0x%08x  r5:0x%08x r6:0x%08x r7:0x%08x\n",
+                 fc->context.proc.xcp.regs[REG_R0],  fc->context.proc.xcp.regs[REG_R1],
+                 fc->context.proc.xcp.regs[REG_R2],  fc->context.proc.xcp.regs[REG_R3],
+                 fc->context.proc.xcp.regs[REG_R4],  fc->context.proc.xcp.regs[REG_R5],
+                 fc->context.proc.xcp.regs[REG_R6],  fc->context.proc.xcp.regs[REG_R7]);
+
+    write(fd, buffer,n);
+    n  = snprintf(buffer, max, "r8:0x%08x r9:0x%08x r10:0x%08x r11:0x%08x r12:0x%08x  sp:0x%08x lr:0x%08x pc:0x%08x\n",
+                  fc->context.proc.xcp.regs[REG_R8],  fc->context.proc.xcp.regs[REG_R9],
+                  fc->context.proc.xcp.regs[REG_R10], fc->context.proc.xcp.regs[REG_R11],
+                  fc->context.proc.xcp.regs[REG_R12], fc->context.proc.xcp.regs[REG_R13],
+                  fc->context.proc.xcp.regs[REG_R14], fc->context.proc.xcp.regs[REG_R15]);
+
+    write(fd, buffer,n);
+
+#ifdef CONFIG_ARMV7M_USEBASEPRI
+    n = snprintf(buffer, max, "xpsr:0x%08x basepri:0x%08x control:0x%08x\n",
+                 fc->context.proc.xcp.regs[REG_XPSR],  fc->context.proc.xcp.regs[REG_BASEPRI],
+                 getcontrol());
+#else
+    n = snprintf(buffer, max, "xpsr:0x%08x primask:0x%08x control:0x%08x\n",
+                 fc->context.proc.xcp.regs[REG_XPSR],  fc->context.proc.xcp.regs[REG_PRIMASK],
+                 getcontrol());
+#endif
+    write(fd, buffer,n);
+
+#ifdef REG_EXC_RETURN
+    n = snprintf(buffer, max, "exe return:0x%08x\n", fc->context.proc.xcp.regs[REG_EXC_RETURN]);
+    write(fd, buffer,n);
+#endif
+}
+
 
 fullcontext_s dump;
 
@@ -550,7 +608,10 @@ __EXPORT void board_crashdump(uint32_t currentsp, void *tcb, uint8_t *filename, 
 
   stm32_bbsram_savepanic(HARDFAULT_FILENO, (uint8_t*)&dump, sizeof(dump));
 
-  char line[80];
+/* This it a test */
+  char line[200];
+  int fd = fileno(stdout);
+  int n;
 
   int spaddr = dump.context.stack.current_sp;
   int topaddr = dump.context.stack.itopofstack;
@@ -558,8 +619,9 @@ __EXPORT void board_crashdump(uint32_t currentsp, void *tcb, uint8_t *filename, 
   int winsize = arraySize(dump.istack);
   int wtopaddr = spaddr + winsize/2;
   if ((dump.info.stuff & eIntStack) != 0) {
+
       print_stack(dump.istack, winsize, wtopaddr, topaddr, spaddr, botaddr,
-                  "Interrupt sp", line, sizeof(line), fileno(stdout));
+                  "Interrupt sp", line, sizeof(line), fd);
   }
   if ((dump.info.stuff & eUserStack) != 0) {
       spaddr = dump.context.proc.xcp.regs[REG_R13];
@@ -567,9 +629,67 @@ __EXPORT void board_crashdump(uint32_t currentsp, void *tcb, uint8_t *filename, 
       botaddr = dump.context.stack.utopofstack - dump.context.stack.ustacksize;
       winsize = arraySize(dump.ustack);
       wtopaddr = spaddr + winsize/2;
+
       print_stack(dump.istack, winsize, wtopaddr, topaddr, spaddr, botaddr,
-                  "User sp", line, sizeof(line), fileno(stdout));
+                  "User sp", line, sizeof(line), fd);
   }
+
+  bool isFault = dump.info.current_regs != 0 && dump.context.proc.pid == 0;
+  if (isFault) {
+      n = snprintf(line, sizeof(line), "System fault:\n Type:Hard Fault\n");
+  } else {
+      n = snprintf(line, sizeof(line), "System fault:\n Type:Assertion failed ");
+  }
+  write(fd, line,n);
+
+#ifdef CONFIG_PRINT_TASKNAME
+    n = snprintf(line, sizeof(line), " in file:%s at line: %d running task: %s\n",dump.info.filename, dump.info.lineno, dump.proc.name);
+#else
+    n = snprintf(line, sizeof(line), " in file:%s at line: %d \n", dump.info.filename, dump.info.lineno);
+#endif
+    write(fd, line,n);
+
+    n = snprintf(line, sizeof(line), "FW git-hash: %s\n", FW_GIT);
+    write(fd, line,n);
+    n = snprintf(line, sizeof(line), "Build datetime: %s %s\n", __DATE__, __TIME__);
+    write(fd, line,n);
+
+  if (dump.info.stuff & eRegs) {
+      n = snprintf(line, sizeof(line), "Processor registers: from 0x%08x\n", dump.info.current_regs);
+      write(fd, line,n);
+    print_register(&dump,line, sizeof(line), fd);
+  }
+
+
+  n = snprintf(line, sizeof(line), "System Stacks\n");
+  if ((dump.info.stuff & eIntStack) != 0) {
+
+      spaddr = dump.context.stack.current_sp;
+      topaddr = dump.context.stack.itopofstack;
+      botaddr = dump.context.stack.itopofstack - dump.context.stack.istacksize;
+
+      print_stack_info(dump.context.stack.istacksize, topaddr, spaddr,
+                       botaddr, "IRQ", line, sizeof(line), fd);
+  }
+
+  if ((dump.info.stuff & eUserStack) != 0) {
+
+      spaddr = dump.context.proc.xcp.regs[REG_R13];
+      topaddr = dump.context.stack.utopofstack;
+      botaddr = dump.context.stack.utopofstack - dump.context.stack.ustacksize;
+
+      print_stack_info(dump.context.stack.ustacksize, topaddr, spaddr,
+                       botaddr, "IRQ", line, sizeof(line), fd);
+  }
+
+  n = snprintf(line, sizeof(line), "\n Oh I see the Problem...");
+  write(fd, line,n);
+  sleep(1);
+  n = snprintf(line, sizeof(line), "it is on line 60.. of...");
+  write(fd, line,n);
+  sleep(1);
+  n = snprintf(line, sizeof(line), "nah just kidding\n\n");
+  write(fd, line,n);
 
 #if defined(CONFIG_BOARD_RESET_ON_CRASH)
   systemreset(false);
