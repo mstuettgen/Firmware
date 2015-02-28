@@ -1,6 +1,7 @@
 /****************************************************************************
  *
  *   Copyright (C) 2015 PX4 Development Team. All rights reserved.
+ *   Author: @author David Sidrane <david_s5@nscdg.com>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -35,10 +36,17 @@
  * Included Files
  ****************************************************************************/
 #include <systemlib/px4_macros.h>
+#include <stm32_bbsram.h>
 
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
+#define FREEZE_STR(s) #s
+#define STRINGIFY(s) FREEZE_STR(s)
+#define HARDFAULT_FILENO 3
+#define HARDFAULT_PATH BBSRAM_PATH""STRINGIFY(HARDFAULT_FILENO)
+
+
 #define BBSRAM_SIZE_FN0 1
 #define BBSRAM_SIZE_FN1 256
 #define BBSRAM_SIZE_FN2 256
@@ -46,7 +54,7 @@
 
 /* The following guides in the amount of the user and interrupt stack
  * data we can save. The amount of storage left will dictate the actual
- * number of entries of the user stack data saved. If it is toobig
+ * number of entries of the user stack data saved. If it is too big
  * It will be truncated by the call to stm32_bbsram_savepanic
  */
 #define BBSRAM_HEADER_SIZE 20 /* This is an assumption */
@@ -74,39 +82,91 @@
     0                  /* End of table marker */                  \
 }
 
+/* For Assert keep this much of the file name*/
 #define MAX_FILE_PATH_LENGTH 40
+
+
+/* Fixed size strings
+ * To change a format add the number of chars not represented by the format
+ * Specifier to the xxxx_NUM definei.e %Y is YYYY so add 2 and %s is -2
+ * Also xxxxTIME_FMT need to match in size. See CCASERT in hardfault_log.c
+ */
+#define LOG_PATH_BASE       "/fs/microsd/"
+#define LOG_PATH_BASE_LEN    ((arraySize(LOG_PATH_BASE))-1)
+
+#define LOG_NAME_FMT        "fault_%s.log"
+#define LOG_NAME_NUM         (     -2    )
+#define LOG_NAME_LEN         ((arraySize(LOG_NAME_FMT)-1) + LOG_NAME_NUM)
+
+#define TIME_FMT             "%Y_%m_%d_%H_%M_%S"
+#define TIME_FMT_NUM         (2+ 0+ 0+ 0+ 0+ 0)
+#define TIME_FMT_LEN         (((arraySize(TIME_FMT)-1) + TIME_FMT_NUM))
+
+#define LOG_PATH_LEN         ((LOG_PATH_BASE_LEN + LOG_NAME_LEN + TIME_FMT_LEN))
+
+#define HEADER_TIME_FMT      "%Y-%m-%d-%H:%M:%S"
+#define HEADER_TIME_FMT_NUM  (2+ 0+ 0+ 0+ 0+ 0)
+#define HEADER_TIME_FMT_LEN  (((arraySize(HEADER_TIME_FMT)-1) + HEADER_TIME_FMT_NUM))
+
+/* Select which format to use. On a terminal the details are at the bottom
+ * and in a file they are at the top
+ */
+#define HARDFAULT_DISPLAY_FORMAT 1
+#define HARDFAULT_FILE_FORMAT    0
 
 /****************************************************************************
  * Public Types
  ****************************************************************************/
+#undef EXTERN
+#if defined(__cplusplus)
+#define EXTERN extern "C"
+extern "C"
+{
+#else
+#define EXTERN extern
+#endif
 
+/* Used for stack frame storage */
 typedef uint32_t stack_word_t;
 
 typedef  struct {
-  int pid;
-  struct xcptcontext xcp;                /* Interrupt register save area        */
+  int pid;                               /* Process ID */
+  struct xcptcontext xcp;                /* Interrupt register save area     */
 #if CONFIG_TASK_NAME_SIZE > 0
-  char name[CONFIG_TASK_NAME_SIZE+1];    /* Task name (with NUL terminator)     */
+  char name[CONFIG_TASK_NAME_SIZE+1];    /* Task name (with NULL terminator) */
 #endif
 } process_t;
 
+/* Stack related data */
 typedef struct {
+  uint32_t current_sp;   /* The stack the up_assert is running on
+                          * it may be either the user stack for an assertion
+                          *  failure or the interrupt stack in the case of a
+                          * hard fault
+                          */
+  uint32_t utopofstack;  /* Top of the user stack at the time of the
+                          * up_assert
+                          */
+  uint32_t ustacksize;   /* Size of the user stack at the time of the
+                          * up_assert
+                          */
 
-  uint32_t current_sp;
-  uint32_t utopofstack;
-  uint32_t ustacksize;
 #if CONFIG_ARCH_INTERRUPTSTACK > 3
-  uint32_t itopofstack;
-  uint32_t istacksize;
+
+  uint32_t itopofstack;   /* Top of the interrupt stack at the time of the
+                           * up_assert
+                           */
+  uint32_t istacksize;    /* Size of the interrupt stack at the time of the
+                           * up_assert
+                           */
 #endif
 
 } stack_t;
 
-/* for reference only */
+/* Not Used for reference only */
 
 typedef struct
 {
-
   uint32_t r0;
   uint32_t r1;
   uint32_t r2;
@@ -184,7 +244,8 @@ typedef struct
   uint32_t s31;
 } proc_regs_s;
 
-/* What is in the dump */
+
+/* Flags to identify what is in the dump */
 typedef enum {
   eRegs         = 0x01,
   eUserStack    = 0x02,
@@ -194,24 +255,107 @@ typedef enum {
 } stuff_t;
 
 typedef struct {
-  stuff_t stuff;          /* What is in the dump */
-  uintptr_t current_regs; /* Used to validate the dump */
-  int lineno;
-  char filename[MAX_FILE_PATH_LENGTH];
+  stuff_t stuff;                       /* What is in the dump */
+  uintptr_t current_regs;              /* Used to validate the dump */
+  int lineno;                          /* __LINE__ to up_assert */
+  char filename[MAX_FILE_PATH_LENGTH]; /* Last MAX_FILE_PATH_LENGTH of chars in
+                                        * __FILE__ to up_assert
+                                        */
 } info_s;
 
-typedef struct {
+typedef struct {                        /* The Context data */
   stack_t     stack;
   process_t   proc;
 } context_s;
 
 typedef struct {
-  info_s    info;
-  context_s context;
-#if CONFIG_ARCH_INTERRUPTSTACK > 3
+  info_s    info;                       /* Then info */
+  context_s context;                    /* The Context data */
+#if CONFIG_ARCH_INTERRUPTSTACK > 3      /* The amount of stack data is compile time
+                                         * sized backed on what is left after the
+                                         * other BBSRAM files are defined
+                                         * The order is such that only the
+                                         * ustack should be truncated
+                                         */
   stack_word_t istack[CONFIG_USTACK_SIZE];
 #endif
   stack_word_t ustack[CONFIG_ISTACK_SIZE];
 } fullcontext_s;
 
+/****************************************************************************
+ * Name: check_hardfault_satus
+ *
+ * Description:
+ *      Check the status of the BBSRAM hard fault file which can be in
+ *      one of two states Armed, Valid or Broken.
+ *
+ *      Armed - The file in the armed state is not accessible in the fs
+ *              the act of unlinking it is what arms it.
+ *
+ *      Valid - The file in the armed state is not accessible in the fs
+ *              the act of unlinking it is what arms it.
+ *
+ * Inputs:
+ *   - caller:  A label to display in syslog output
+ *
+ *  Returned Value:
+ *   -ENOENT    Armed - The file in the armed state
+ *    OK        Valid - The file contains data from a fault that has not
+ *                      been committed to disk (see write_hardfault).
+ *   -  Any < 0 Broken - Should not happen
+ *
+ ****************************************************************************/
+int check_hardfault_satus(char *caller);
+
+/****************************************************************************
+ * Name: write_hardfault
+ *
+ * Description:
+ *      Will parse and write a human readable output of the data
+ *      in the BBSRAM file. Once
+ *
+ *
+ * Inputs:
+ *   - caller:  A label to display in syslog output
+ *   - fd:      An FD to write the data to
+ *   - format:  Select which format to use.
+ *
+ *              HARDFAULT_DISPLAY_FORMAT  On the console the details are
+ *                                        at the bottom
+ *              HARDFAULT_FILE_FORMAT     In a file details are at the top
+ *                                        of the log file
+ *
+ *    - rearm: If true will move the file to the Armed state, if
+ *             false the file is not armed and can be read again
+ *
+ *  Returned Value:
+ *
+ *    OK  or errno
+ *
+ *
+ ****************************************************************************/
+int write_hardfault(char *caller, int fd, int format, bool rearm);
+
+/****************************************************************************
+ * Name: rearm_hardfaults
+ *
+ * Description:
+ *      Will move the file to the Armed state
+ *
+ *
+ * Inputs:
+ *   - caller:  A label to display in syslog output
+ *
+ *  Returned Value:
+ *
+ *    OK  or errno
+ *
+ *
+ ****************************************************************************/
+int rearm_hardfaults(char *caller);
+
+#if defined(__cplusplus)
+extern "C"
+}
+#endif
 

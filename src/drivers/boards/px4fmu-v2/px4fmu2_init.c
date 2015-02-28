@@ -52,7 +52,6 @@
 #include <string.h>
 #include <debug.h>
 #include <errno.h>
-#include <fcntl.h>
 
 
 #include <nuttx/arch.h>
@@ -66,7 +65,6 @@
 #include <stm32.h>
 #include "board_config.h"
 #include <stm32_uart.h>
-#include <stm32_bbsram.h>
 
 #include <arch/board/board.h>
 
@@ -78,13 +76,10 @@
 #include <systemlib/perf_counter.h>
 
 #include <systemlib/hardfault_log.h>
-#include <lib/version/version.h>
 
 #if defined(CONFIG_HAVE_CXX) && defined(CONFIG_HAVE_CXXINITIALIZE)
 #include <systemlib/systemlib.h>
 #endif
-
-#include "up_internal.h"
 
 /* todo: This is constant but not proper */
 __BEGIN_DECLS
@@ -94,10 +89,6 @@ __END_DECLS
 /****************************************************************************
  * Pre-Processor Definitions
  ****************************************************************************/
-#define FREEZE_STR(s) #s
-#define STRINGIFY(s) FREEZE_STR(s)
-#define HARDFAULT_FILENO 3
-#define HARDFAULT_PATH BBSRAM_PATH""STRINGIFY(HARDFAULT_FILENO)
 
 /* Configuration ************************************************************/
 
@@ -253,39 +244,24 @@ __EXPORT int nsh_archinitialize(void)
 #else
 #  error platform is dependent on c++ both CONFIG_HAVE_CXX and CONFIG_HAVE_CXXINITIALIZE must be defined.
 #endif
+
 #if defined(CONFIG_STM32_BBSRAM)
+
+	/* Using Battery Backed Up SRAM */
+
 	int filesizes[CONFIG_STM32_BBSRAM_FILES+1] = BSRAM_FILE_SIZES;
 	int nfc = stm32_bbsraminitialize(BBSRAM_PATH, filesizes);
 
-        syslog(LOG_INFO, "[boot] %d Battery Back File(s) \n",nfc);
-#if defined(CONFIG_STM32_SAVE_CRASHDUMP)
-        int fd = open(HARDFAULT_PATH,O_RDONLY);
-        if (fd < 0 ) {
-            syslog(LOG_INFO, "[boot] Failed to open Crash Log file (%d)\n",fd);
-        } else {
-            struct bbsramd_s desc;
-            int rv = ioctl(fd, STM32_BBSRAM_GETDESC_IOCTL, (unsigned long)((uintptr_t)&desc));
-            if (rv < 0) {
-                syslog(LOG_INFO, "[boot] Failed to get Crash Log dec (%d)\n",rv);
-            } else {
-                syslog(LOG_INFO, "[boot] Crash Log info File No %d Length %d state:0x%02x %lu sec, %lu nsec)\n",
-                    (unsigned int)desc.fileno, (unsigned int) desc.len, (unsigned int)desc.flags,
-                    (unsigned long)desc.lastwrite.tv_sec,(unsigned long)desc.lastwrite.tv_nsec);
-                if (desc.lastwrite.tv_sec || desc.lastwrite.tv_nsec) {
-                    syslog(LOG_INFO, "[boot] Crash Log Valid...parsing)\n");
+        syslog(LOG_INFO, "[boot] %d Battery Backed Up File(s) \n",nfc);
 
-                }
-                rv = close(fd);
-                if (rv < 0) {
-                    syslog(LOG_INFO, "[boot] Failed to Close Crash Log (%d)\n",rv);
-                } else {
-                    rv = unlink(HARDFAULT_PATH);
-                    if (rv < 0) {
-                        syslog(LOG_INFO, "[boot] Failed to Rearm Crash Log (%d)\n",rv);
-                    }
-                }
-            }
+#if defined(CONFIG_STM32_SAVE_CRASHDUMP)
+
+        /* Panic Logging in Battery Backed Up Files */
+        int hadCrash = check_hardfault_satus("boot");
+        if (hadCrash == OK) {
+            write_hardfault("boot", fileno(stdout), HARDFAULT_DISPLAY_FORMAT, false);
         }
+
 #endif // CONFIG_STM32_SAVE_CRASHDUMP
 #endif // CONFIG_STM32_BBSRAM
 
@@ -403,93 +379,14 @@ __EXPORT int nsh_archinitialize(void)
 	return OK;
 }
 
-static void print_stack_info(int size, uint32_t topaddr, uint32_t spaddr,
-                             uint32_t botaddr, char *sp_name, char *buffer, int max, int fd)
-{
-
-  int n = 0;
-  n =   snprintf(&buffer[n], max-n, "%s stack:\n",sp_name);
-  n +=  snprintf(&buffer[n], max-n, "  top:    0x%08x\n", topaddr);
-  n +=  snprintf(&buffer[n], max-n, "  sp:     0x%08x\n", spaddr);
-  write(fd, buffer,n);
-  n = 0;
-  n +=  snprintf(&buffer[n], max-n, "  bottom: 0x%08x\n", botaddr);
-  n +=  snprintf(&buffer[n], max-n, "  size:   0x%08x\n", size);
-  write(fd, buffer,n);
-#ifndef CONFIG_STACK_COLORATION
-  FAR struct tcb_s tcb;
-  tcb.stack_alloc_ptr = (void*) botaddr;
-  tcb.adj_stack_size = size;
-  n = snprintf(buffer, max,         "  used:   %08x\n", up_check_tcbstack(&tcb));
-  write(fd, buffer,n);
-#endif
-}
-
-static void print_stack(stack_word_t *swindow, int winsize, uint32_t wtopaddr,
-                        uint32_t topaddr, uint32_t spaddr, uint32_t botaddr,
-                        char *sp_name, char *buffer, int max, int fd)
-{
-   char marker[30];
-   for (int i = winsize; i >= 0; i--) {
-       if (wtopaddr == topaddr) {
-           strncpy(marker, "<-- ", sizeof(marker));
-           strncat(marker, sp_name, sizeof(marker));
-           strncat(marker, " top", sizeof(marker));
-       } else if (wtopaddr == spaddr) {
-           strncpy(marker, "<-- ", sizeof(marker));
-           strncat(marker, sp_name, sizeof(marker));
-       } else if (wtopaddr == botaddr) {
-           strncpy(marker, "<-- ", sizeof(marker));
-           strncat(marker, sp_name, sizeof(marker));
-           strncat(marker, " bottom", sizeof(marker));
-       } else {
-           marker[0] = '\0';
-       }
-       int n = snprintf(buffer, max,"0x%08x 0x%08x%s\n", wtopaddr, swindow[i], marker);
-       write(fd, buffer,n);
-       wtopaddr--;
-    }
-}
-
-static void print_register(fullcontext_s* fc, char *buffer, int max, int fd)
-{
-    int n = snprintf(buffer, max, "r0:0x%08x r1:0x%08x  r2:0x%08x  r3:0x%08x  r4:0x%08x  r5:0x%08x r6:0x%08x r7:0x%08x\n",
-                 fc->context.proc.xcp.regs[REG_R0],  fc->context.proc.xcp.regs[REG_R1],
-                 fc->context.proc.xcp.regs[REG_R2],  fc->context.proc.xcp.regs[REG_R3],
-                 fc->context.proc.xcp.regs[REG_R4],  fc->context.proc.xcp.regs[REG_R5],
-                 fc->context.proc.xcp.regs[REG_R6],  fc->context.proc.xcp.regs[REG_R7]);
-
-    write(fd, buffer,n);
-    n  = snprintf(buffer, max, "r8:0x%08x r9:0x%08x r10:0x%08x r11:0x%08x r12:0x%08x  sp:0x%08x lr:0x%08x pc:0x%08x\n",
-                  fc->context.proc.xcp.regs[REG_R8],  fc->context.proc.xcp.regs[REG_R9],
-                  fc->context.proc.xcp.regs[REG_R10], fc->context.proc.xcp.regs[REG_R11],
-                  fc->context.proc.xcp.regs[REG_R12], fc->context.proc.xcp.regs[REG_R13],
-                  fc->context.proc.xcp.regs[REG_R14], fc->context.proc.xcp.regs[REG_R15]);
-
-    write(fd, buffer,n);
-
-#ifdef CONFIG_ARMV7M_USEBASEPRI
-    n = snprintf(buffer, max, "xpsr:0x%08x basepri:0x%08x control:0x%08x\n",
-                 fc->context.proc.xcp.regs[REG_XPSR],  fc->context.proc.xcp.regs[REG_BASEPRI],
-                 getcontrol());
-#else
-    n = snprintf(buffer, max, "xpsr:0x%08x primask:0x%08x control:0x%08x\n",
-                 fc->context.proc.xcp.regs[REG_XPSR],  fc->context.proc.xcp.regs[REG_PRIMASK],
-                 getcontrol());
-#endif
-    write(fd, buffer,n);
-
-#ifdef REG_EXC_RETURN
-    n = snprintf(buffer, max, "exe return:0x%08x\n", fc->context.proc.xcp.regs[REG_EXC_RETURN]);
-    write(fd, buffer,n);
-#endif
-}
-
-
+//todo:need to be on the stack or on ans unallocated label.
+// This is bacause (#pragma ignored not working for -Werror=frame-larger-than=]
 fullcontext_s dump;
 
 __EXPORT void board_crashdump(uint32_t currentsp, void *tcb, uint8_t *filename, int lineno)
 {
+//  fullcontext_s dump;
+
   (void)irqsave();
 
   struct tcb_s *rtcb = (struct tcb_s *)tcb;
@@ -537,7 +434,7 @@ __EXPORT void board_crashdump(uint32_t currentsp, void *tcb, uint8_t *filename, 
   if (current_regs)
     {
       dump.info.stuff |= eRegs;
-      memcpy(&dump.context.proc.xcp.regs, (void*)current_regs, sizeof(dump.context.proc.xcp));
+      memcpy(&dump.context.proc.xcp.regs, (void*)current_regs, sizeof(dump.context.proc.xcp.regs));
       currentsp = dump.context.proc.xcp.regs[REG_R13];
     }
 
@@ -608,91 +505,6 @@ __EXPORT void board_crashdump(uint32_t currentsp, void *tcb, uint8_t *filename, 
 
   stm32_bbsram_savepanic(HARDFAULT_FILENO, (uint8_t*)&dump, sizeof(dump));
 
-/* This it a test */
-  char line[200];
-  int fd = fileno(stdout);
-  int n;
-
-  int spaddr = dump.context.stack.current_sp;
-  int topaddr = dump.context.stack.itopofstack;
-  int botaddr = dump.context.stack.itopofstack - dump.context.stack.istacksize;
-  int winsize = arraySize(dump.istack);
-  int wtopaddr = spaddr + winsize/2;
-  if ((dump.info.stuff & eIntStack) != 0) {
-
-      print_stack(dump.istack, winsize, wtopaddr, topaddr, spaddr, botaddr,
-                  "Interrupt sp", line, sizeof(line), fd);
-  }
-  if ((dump.info.stuff & eUserStack) != 0) {
-      spaddr = dump.context.proc.xcp.regs[REG_R13];
-      topaddr = dump.context.stack.utopofstack;
-      botaddr = dump.context.stack.utopofstack - dump.context.stack.ustacksize;
-      winsize = arraySize(dump.ustack);
-      wtopaddr = spaddr + winsize/2;
-
-      print_stack(dump.istack, winsize, wtopaddr, topaddr, spaddr, botaddr,
-                  "User sp", line, sizeof(line), fd);
-  }
-
-  bool isFault = dump.info.current_regs != 0 && dump.context.proc.pid == 0;
-  if (isFault) {
-      n = snprintf(line, sizeof(line), "System fault:\n Type:Hard Fault\n");
-  } else {
-      n = snprintf(line, sizeof(line), "System fault:\n Type:Assertion failed ");
-  }
-  write(fd, line,n);
-
-#ifdef CONFIG_PRINT_TASKNAME
-    n = snprintf(line, sizeof(line), " in file:%s at line: %d running task: %s\n",dump.info.filename, dump.info.lineno, dump.proc.name);
-#else
-    n = snprintf(line, sizeof(line), " in file:%s at line: %d \n", dump.info.filename, dump.info.lineno);
-#endif
-    write(fd, line,n);
-
-    n = snprintf(line, sizeof(line), "FW git-hash: %s\n", FW_GIT);
-    write(fd, line,n);
-    n = snprintf(line, sizeof(line), "Build datetime: %s %s\n", __DATE__, __TIME__);
-    write(fd, line,n);
-
-  if (dump.info.stuff & eRegs) {
-      n = snprintf(line, sizeof(line), "Processor registers: from 0x%08x\n", dump.info.current_regs);
-      write(fd, line,n);
-    print_register(&dump,line, sizeof(line), fd);
-  }
-
-
-  n = snprintf(line, sizeof(line), "System Stacks\n");
-  if ((dump.info.stuff & eIntStack) != 0) {
-
-      spaddr = dump.context.stack.current_sp;
-      topaddr = dump.context.stack.itopofstack;
-      botaddr = dump.context.stack.itopofstack - dump.context.stack.istacksize;
-
-      print_stack_info(dump.context.stack.istacksize, topaddr, spaddr,
-                       botaddr, "IRQ", line, sizeof(line), fd);
-  }
-
-  if ((dump.info.stuff & eUserStack) != 0) {
-
-      spaddr = dump.context.proc.xcp.regs[REG_R13];
-      topaddr = dump.context.stack.utopofstack;
-      botaddr = dump.context.stack.utopofstack - dump.context.stack.ustacksize;
-
-      print_stack_info(dump.context.stack.ustacksize, topaddr, spaddr,
-                       botaddr, "IRQ", line, sizeof(line), fd);
-  }
-
-  n = snprintf(line, sizeof(line), "\n Oh I see the Problem...");
-  write(fd, line,n);
-  fflush(stdout);
-  sleep(1);
-  n = snprintf(line, sizeof(line), "it is on line 60.. of...");
-  write(fd, line,n);
-  fflush(stdout);
-  sleep(1);
-  n = snprintf(line, sizeof(line), "nah just kidding\n\n");
-  write(fd, line,n);
-  fflush(stdout);
 
 #if defined(CONFIG_BOARD_RESET_ON_CRASH)
   systemreset(false);
